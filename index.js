@@ -1,48 +1,45 @@
 import dotenv from "dotenv";
+import express from "express";
+import crypto from "crypto";
 import axios from "axios";
-import cron from "node-cron";
+import bodyParser from "body-parser";
 
 dotenv.config();
+
+const app = express();
+const PORT = process.env.PORT || 3000;
 
 const shopifyStore = process.env.SHOPIFY_STORE;
 const accessToken = process.env.SHOPIFY_ACCESS_TOKEN;
 const VIP_SPEND_THRESHOLD =
   parseFloat(process.env.VIP_SPEND_THRESHOLD) || 11000;
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
 
 const shopifyHeaders = {
   "Content-Type": "application/json",
   "X-Shopify-Access-Token": accessToken,
 };
 
-async function getAllCustomers() {
-  try {
-    const customers = [];
-    let url = `https://${shopifyStore}/admin/api/2023-10/customers.json?limit=250`;
+function verifyWebhook(req) {
+  if (!WEBHOOK_SECRET) return true;
 
-    while (url) {
-      const response = await axios.get(url, { headers: shopifyHeaders });
+  const hmac = req.headers["x-shopify-hmac-sha256"];
+  const body = req.rawBody;
+  const calculatedHmac = crypto
+    .createHmac("sha256", WEBHOOK_SECRET)
+    .update(body, "utf8")
+    .digest("base64");
 
-      const pageCustomers = response.data.customers;
-      customers.push(...pageCustomers);
-
-      const linkHeader = response.headers.link || response.headers.Link;
-      if (linkHeader && linkHeader.includes('rel="next"')) {
-        url = linkHeader.split("<")[1].split(">")[0];
-      } else {
-        url = null;
-      }
-    }
-
-    console.log(`Found ${customers.length} customers in total`);
-    return customers;
-  } catch (error) {
-    console.error(
-      "Error fetching customers:",
-      error.response?.data || error.message
-    );
-    throw error;
-  }
+  return hmac === calculatedHmac;
 }
+
+app.use(
+  bodyParser.json({
+    verify: (req, res, buf) => {
+      req.rawBody = buf.toString();
+    },
+  })
+);
 
 async function getCustomerOrders(customerId) {
   try {
@@ -140,63 +137,114 @@ async function addCustomerNote(customerId, note) {
   }
 }
 
-async function tagVIPCustomers() {
+async function getCustomer(customerId) {
   try {
-    console.log("Starting VIP customer tagging process...");
-    console.log(`VIP threshold: ₹${VIP_SPEND_THRESHOLD}`);
-
-    const customers = await getAllCustomers();
-    let vipCount = 0;
-    let newVipCount = 0;
-
-    for (const customer of customers) {
-      const lifetimeSpend = await calculateLifetimeSpend(customer.id);
-      console.log(
-        `Customer ${customer.id} (${
-          customer.email
-        }): Lifetime spend ₹${lifetimeSpend.toFixed(2)}`
-      );
-
-      if (lifetimeSpend >= VIP_SPEND_THRESHOLD) {
-        vipCount++;
-
-        const currentTags = customer.tags ? customer.tags.split(", ") : [];
-
-        if (!currentTags.includes("VIP-Customer")) {
-          newVipCount++;
-
-          currentTags.push("VIP-Customer");
-          await updateCustomerTags(customer.id, currentTags.join(", "));
-
-          const timestamp = new Date().toISOString();
-          const note = `Tagged as VIP-Customer on ${timestamp} (Lifetime spend: ₹${lifetimeSpend.toFixed(
-            2
-          )})`;
-          await addCustomerNote(customer.id, note);
-
-          console.log(
-            `✅ Added VIP tag to customer ${customer.id} (${customer.email})`
-          );
-        } else {
-          console.log(
-            `⏩ Customer ${customer.id} (${customer.email}) is already tagged as VIP`
-          );
-        }
-      }
-    }
-
-    console.log(
-      `VIP tagging process completed: ${vipCount} total VIP customers, ${newVipCount} newly tagged`
+    const response = await axios.get(
+      `https://${shopifyStore}/admin/api/2023-10/customers/${customerId}.json`,
+      { headers: shopifyHeaders }
     );
+    return response.data.customer;
   } catch (error) {
-    console.error("Error in VIP tagging process:", error);
+    console.error(
+      `Error fetching customer ${customerId}:`,
+      error.response?.data || error.message
+    );
+    throw error;
   }
 }
 
-cron.schedule("0 0 * * *", () => {
-  console.log("Running scheduled VIP tagging task...");
-  tagVIPCustomers();
+async function processOrder(order) {
+  if (
+    !order.customer ||
+    (order.financial_status !== "paid" &&
+      order.financial_status !== "partially_paid")
+  ) {
+    return;
+  }
+
+  const customerId = order.customer.id;
+  console.log(`Processing order ${order.id} for customer ${customerId}`);
+
+  try {
+    const customer = await getCustomer(customerId);
+    const currentTags = customer.tags ? customer.tags.split(", ") : [];
+
+    if (currentTags.includes("VIP-Customer")) {
+      console.log(`Customer ${customerId} is already tagged as VIP`);
+      return;
+    }
+
+    const lifetimeSpend = await calculateLifetimeSpend(customerId);
+    console.log(
+      `Customer ${customerId} lifetime spend: ₹${lifetimeSpend.toFixed(2)}`
+    );
+
+    if (lifetimeSpend >= VIP_SPEND_THRESHOLD) {
+      currentTags.push("VIP-Customer");
+      await updateCustomerTags(customerId, currentTags.join(", "));
+
+      const timestamp = new Date().toISOString();
+      const note = `Tagged as VIP-Customer on ${timestamp} (Lifetime spend: ₹${lifetimeSpend.toFixed(
+        2
+      )})`;
+      await addCustomerNote(customerId, note);
+
+      console.log(`✅ Added VIP tag to customer ${customerId}`);
+    }
+  } catch (error) {
+    console.error(`Error processing order for VIP status: ${error.message}`);
+  }
+}
+
+app.post("/webhooks/orders/paid", async (req, res) => {
+  if (!verifyWebhook(req)) {
+    console.error("Invalid webhook signature");
+    return res.status(401).send("Invalid webhook signature");
+  }
+
+  res.status(200).send("OK");
+
+  try {
+    const order = req.body;
+    await processOrder(order);
+  } catch (error) {
+    console.error("Error processing webhook:", error);
+  }
 });
 
-console.log("VIP Tag Automation service started");
-tagVIPCustomers();
+app.post("/webhooks/orders/create", async (req, res) => {
+  if (!verifyWebhook(req)) {
+    console.error("Invalid webhook signature");
+    return res.status(401).send("Invalid webhook signature");
+  }
+
+  res.status(200).send("OK");
+
+  try {
+    const order = req.body;
+
+    if (
+      order.financial_status === "paid" ||
+      order.financial_status === "partially_paid"
+    ) {
+      await processOrder(order);
+    } else {
+      console.log(`Order ${order.id} is not paid yet, skipping VIP check`);
+    }
+  } catch (error) {
+    console.error("Error processing webhook:", error);
+  }
+});
+
+app.get("/", (req, res) => {
+  res.send({
+    status: "active",
+    service: "Shopify VIP Tag Automation (Webhook Version)",
+    threshold: `₹${VIP_SPEND_THRESHOLD}`,
+  });
+});
+
+app.listen(PORT, () => {
+  console.log(`VIP Tag Webhook Service running on port ${PORT}`);
+  console.log(`VIP threshold: ₹${VIP_SPEND_THRESHOLD}`);
+});
